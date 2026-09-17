@@ -230,7 +230,7 @@ async def extract_results(page: Page) -> list[Convocatoria]:
 
     alertas: list[str] = []
     results: list[Convocatoria] = []
-    for index in range(min(total, 5)):
+    for index in range(1, min(total, 6)):
         row = rows.nth(index)
         tds = row.locator("td")
         if await tds.count() >= 5:
