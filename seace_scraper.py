@@ -230,14 +230,18 @@ async def extract_results(page: Page) -> list[Convocatoria]:
 
     alertas: list[str] = []
     results: list[Convocatoria] = []
-    for index in range(1, min(total, 6)):
+    for index in range(min(total, 6)):
         row = rows.nth(index)
         tds = row.locator("td")
-        if await tds.count() >= 5:
+        cell_count = await tds.count()
+        row_text = clean(await row.inner_text())
+        if "Nombre o Sigla de Entidad" in row_text:
+            continue
+        if cell_count >= 6:
             entidad = (await tds.nth(1).inner_text()).strip()
             fecha = (await tds.nth(2).inner_text()).strip()
             nomenclatura = (await tds.nth(3).inner_text()).strip()
-            objeto = (await tds.nth(5).inner_text()).strip() if await tds.count() > 5 else ""
+            objeto = (await tds.nth(5).inner_text()).strip()
             alerta = (
                 "🔔 *NUEVA OPORTUNIDAD SEACE DETECTADA*\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━\n"
