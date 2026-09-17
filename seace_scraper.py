@@ -25,8 +25,9 @@ from playwright.async_api import (
 
 
 URL = "https://prodapp2.seace.gob.pe/seacebus-uiwd-pub/buscadorConvocatorias/inicio.xhtml"
-DEFAULT_TIMEOUT_MS = 90_000
-MAX_RESULTS = 3
+DEFAULT_TIMEOUT_MS = 180_000
+MAX_EXTRACTION_RESULTS = 5
+NO_RESULTS_MESSAGE = "No se encontraron resultados o el portal demoró en responder"
 
 
 @dataclass(slots=True)
@@ -36,6 +37,8 @@ class Convocatoria:
     objeto_contrato: str
     fecha_publicacion: str
     fecha_limite_registro: str
+    lugar: str = ""
+    ficha_tecnica: str = ""
 
 
 def clean(value: str) -> str:
@@ -51,6 +54,43 @@ async def first_visible(locators: Iterable[Locator]) -> Locator | None:
         if await locator.count() and await locator.first.is_visible():
             return locator.first
     return None
+
+
+async def wait_primefaces_ajax(page: Page, timeout_ms: int) -> None:
+    """Wait for PrimeFaces overlays/spinners and a short DOM settling period."""
+    overlay = page.locator(
+        ".ui-blockui:visible, .ui-widget-overlay:visible, "
+        ".ui-dialog-mask:visible, .ui-progressbar:visible"
+    )
+    try:
+        await overlay.first.wait_for(state="hidden", timeout=timeout_ms)
+    except PlaywrightTimeoutError:
+        # Some SEACE views leave a decorative overlay visible; the DOM check
+        # below is the reliable completion signal.
+        pass
+    await page.wait_for_timeout(500)
+
+
+async def select_primefaces_option(page: Page, value: str, terms: tuple[str, ...]) -> bool:
+    """Select a PrimeFaces ui-selectonemenu by visible option text."""
+    menu = await first_visible(
+        page.locator(
+            ".ui-selectonemenu[id*='{0}' i], "
+            "[id*='{0}' i].ui-selectonemenu".format(term)
+        )
+        for term in terms
+    )
+    if not menu:
+        return False
+    await menu.click()
+    option = page.locator(
+        ".ui-selectonemenu-panel:visible "
+        ".ui-selectonemenu-item:visible"
+    ).filter(has_text=re.compile(rf"^\s*{re.escape(value)}\s*$", re.I)).last
+    await option.wait_for(state="visible", timeout=30_000)
+    await option.click()
+    await wait_primefaces_ajax(page, 30_000)
+    return True
 
 
 async def control_for_label(page: Page, label_text: str, fallback_terms: tuple[str, ...]) -> Locator:
@@ -80,6 +120,8 @@ async def control_for_label(page: Page, label_text: str, fallback_terms: tuple[s
 
 
 async def set_field(page: Page, label: str, value: str, terms: tuple[str, ...]) -> None:
+    if await select_primefaces_option(page, value, terms):
+        return
     try:
         control = await control_for_label(page, label, terms)
     except LookupError:
@@ -95,6 +137,7 @@ async def set_field(page: Page, label: str, value: str, terms: tuple[str, ...]) 
             await control.select_option(label=value)
         except PlaywrightTimeoutError:
             await control.select_option(value=value)
+        await wait_primefaces_ajax(page, 30_000)
         return
 
     await control.fill(value)
@@ -102,6 +145,10 @@ async def set_field(page: Page, label: str, value: str, terms: tuple[str, ...]) 
 
 async def set_object_field(page: Page, value: str) -> None:
     """Set a native select or a PrimeFaces-style editable dropdown."""
+    if await select_primefaces_option(
+        page, value, ("objeto", "tipoObjeto", "objetoContratacion")
+    ):
+        return
     try:
         control = await control_for_label(
             page,
@@ -117,12 +164,17 @@ async def set_object_field(page: Page, value: str) -> None:
         control = visible_inputs.nth(2)
     tag_name = await control.evaluate("(element) => element.tagName.toLowerCase()")
     if tag_name == "select":
-        await control.select_option(label=value)
+        try:
+            await control.select_option(label=value)
+        except PlaywrightTimeoutError:
+            await control.select_option(value=value)
+        await wait_primefaces_ajax(page, 30_000)
         return
 
     await control.fill(value)
     await page.keyboard.press("ArrowDown")
     await page.keyboard.press("Enter")
+    await wait_primefaces_ajax(page, 30_000)
 
 
 async def activate_procedures_search(page: Page, timeout_ms: int) -> None:
@@ -147,79 +199,201 @@ async def submit_search(page: Page, timeout_ms: int) -> None:
     if not button:
         raise LookupError("No se encontró el botón Buscar")
     await button.click()
-
-    # JSF updates the result component asynchronously; wait for either rows or
-    # a visible no-results message instead of relying only on network idle.
-    result_locators = (
-        page.locator("table tbody tr"),
-        page.locator("[id*='resultado' i], [id*='mensaje' i]"),
-        page.get_by_text(re.compile(r"no se encontraron|sin resultados", re.I)),
+    print("[3/4] Clic en Buscar ejecutado. Esperando respuesta AJAX de PrimeFaces...")
+    await wait_primefaces_ajax(page, timeout_ms)
+    await page.wait_for_timeout(4000)
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    result_rows = page.locator(
+        "div[id*='tblResultados' i] tbody tr, "
+        ".ui-datatable-data tr, table tbody tr"
     )
-    for _ in range(max(1, timeout_ms // 500)):
-        if await first_visible(result_locators):
-            return
-        await asyncio.sleep(0.5)
-    raise PlaywrightTimeoutError("Los resultados del buscador no aparecieron a tiempo")
+    if not await result_rows.count():
+        try:
+            await page.screenshot(path="debug_search.png", full_page=True)
+        except Exception:
+            pass
+        await capture_error(page)
 
 
 def header_key(header: str) -> str | None:
     value = normalized(header)
-    if "codigo" in value or "proceso" in value or value.startswith("n°") or value.startswith("nº"):
+    if "nomenclatura" in value or "codigo" in value or "proceso" in value or value.startswith("n°") or value.startswith("nº"):
         return "codigo_proceso"
     if "entidad" in value or "convocante" in value:
         return "entidad"
-    if "objeto" in value or "descripci" in value:
+    if "descripci" in value:
+        return "objeto_contrato"
+    if "objeto" in value:
         return "objeto_contrato"
     if "publicaci" in value:
         return "fecha_publicacion"
     if "limite" in value or "registro" in value or "presentacion" in value:
         return "fecha_limite_registro"
+    if "departamento" in value or "ubicacion" in value or "ubicación" in value or "lugar" in value:
+        return "lugar"
     return None
 
 
-async def extract_results(page: Page) -> list[Convocatoria]:
-    tables = page.locator("table")
-    for table_index in range(await tables.count()):
-        table = tables.nth(table_index)
+async def _extract_results(page: Page) -> list[Convocatoria]:
+    rows = page.locator(
+        "div[id*='tblResultados' i] tbody tr, "
+        ".ui-datatable-data tr, table tbody tr"
+    )
+    deadline = asyncio.get_running_loop().time() + 15
+    while asyncio.get_running_loop().time() < deadline:
+        if await rows.count() and await rows.first.is_visible():
+            print("[4/4] Tabla detectada. Extrayendo registros...")
+            break
+        await page.wait_for_timeout(500)
+    else:
+        await capture_error(page)
+        write_no_results()
+        return []
+
+    first_row = rows.first
+    first_row_class = await first_row.get_attribute("class") or ""
+    if "ui-datatable-empty-message" in first_row_class:
+        await capture_error(page)
+        write_no_results()
+        return []
+
+    results: list[Convocatoria] = []
+    for row_index in range(await rows.count()):
+        row = rows.nth(row_index)
+        cells = [clean(text) for text in await row.locator("td").all_text_contents()]
+        if len(cells) < 5:
+            continue
+        row_text = normalized(" ".join(cells))
+        if any(term in row_text for term in ("cancelado", "desierto", "culminado", "no vigente")):
+            continue
+
+        table = row.locator("xpath=ancestor::table[1]")
         headers = [clean(text) for text in await table.locator("thead th").all_text_contents()]
-        rows = table.locator("tbody tr")
-        if not headers or not await rows.count():
-            continue
-
         keys = [header_key(header) for header in headers]
-        if "codigo_proceso" not in keys and not any("entidad" in normalized(h) for h in headers):
-            continue
+        values = {
+            key: cells[index] for index, key in enumerate(keys)
+            if key and index < len(cells)
+        }
+        # The current SEACE table uses: N°, entity, publication, nomenclature,
+        # reiniciado, object, description. Keep this fallback for dynamic headers.
+        values.setdefault("entidad", cells[1] if len(cells) > 1 else cells[0])
+        values.setdefault("fecha_publicacion", cells[2] if len(cells) > 2 else "")
+        values.setdefault("codigo_proceso", cells[3] if len(cells) > 3 else "")
+        values.setdefault("objeto_contrato", cells[6] if len(cells) > 6 else cells[-1])
 
-        results: list[Convocatoria] = []
-        for row_index in range(await rows.count()):
-            row = rows.nth(row_index)
-            cells = [clean(text) for text in await row.locator("td").all_text_contents()]
-            if not cells:
-                continue
-            row_text = normalized(" ".join(cells))
-            if any(term in row_text for term in ("cancelado", "desierto", "culminado", "no vigente")):
-                continue
-
-            values = {
-                key: cells[index] if index < len(cells) else ""
-                for index, key in enumerate(keys)
-                if key
-            }
-            results.append(
-                Convocatoria(
-                    codigo_proceso=values.get("codigo_proceso", ""),
-                    entidad=values.get("entidad", ""),
-                    objeto_contrato=values.get("objeto_contrato", ""),
-                    fecha_publicacion=values.get("fecha_publicacion", ""),
-                    fecha_limite_registro=values.get("fecha_limite_registro", ""),
-                )
+        detail_link = row.locator("a[href]").first
+        ficha_tecnica = await detail_link.get_attribute("href") if await detail_link.count() else ""
+        results.append(
+            Convocatoria(
+                codigo_proceso=values.get("codigo_proceso", ""),
+                entidad=values.get("entidad", ""),
+                objeto_contrato=values.get("objeto_contrato", ""),
+                fecha_publicacion=values.get("fecha_publicacion", ""),
+                fecha_limite_registro="",
+                lugar="",
+                ficha_tecnica=ficha_tecnica or "",
             )
-            if len(results) == MAX_RESULTS:
-                return results
-        if results:
-            return results
+        )
+        if len(results) == MAX_EXTRACTION_RESULTS:
+            break
+    if not results:
+        await capture_error(page)
+        write_no_results()
+    return results
 
-    raise LookupError("No se encontró una tabla de resultados con convocatorias")
+
+async def extract_results(page: Page) -> list[Convocatoria]:
+    try:
+        return await _extract_results(page)
+    except Exception as error:
+        print(f"Error detectado: {error}")
+        print("Manteniendo el navegador abierto 30 segundos para inspección...")
+        await page.wait_for_timeout(30000)
+        raise
+
+
+async def _pagination_marker(page: Page) -> tuple[str, str]:
+    active = page.locator(".ui-paginator-page.ui-state-active").first
+    active_text = clean(await active.inner_text()) if await active.count() else ""
+    rows = page.locator(
+        "div[id*='tblResultados' i] tbody tr, "
+        ".ui-datatable-data tr, table tbody tr"
+    )
+    first_row = clean(await rows.first.inner_text()) if await rows.count() else ""
+    return active_text, first_row
+
+
+async def paginate_results(page: Page, headed: bool) -> list[Convocatoria]:
+    """Extract every PrimeFaces page without waiting for navigation events."""
+    all_results: list[Convocatoria] = []
+    seen_pages: set[tuple[str, str]] = set()
+
+    while True:
+        marker = await _pagination_marker(page)
+        if marker in seen_pages:
+            break
+        seen_pages.add(marker)
+        page_results = await extract_results(page)
+        all_results.extend(page_results)
+
+        next_button = page.locator(".ui-paginator-next:visible").first
+        if not await next_button.count() or not await next_button.is_visible():
+            if headed:
+                await page.wait_for_timeout(5000)
+            break
+        next_class = await next_button.get_attribute("class") or ""
+        if "ui-state-disabled" in next_class:
+            if headed:
+                await page.wait_for_timeout(5000)
+            break
+
+        await next_button.click()
+        previous_marker = marker
+        await wait_primefaces_ajax(page, 30_000)
+        await page.wait_for_timeout(1500)
+
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            current_marker = await _pagination_marker(page)
+            if current_marker != previous_marker:
+                break
+            await page.wait_for_timeout(500)
+        else:
+            await capture_error(page)
+            raise PlaywrightTimeoutError(
+                "El paginador PrimeFaces no actualizó la tabla"
+            )
+
+    return all_results
+
+
+async def capture_error(page: Page) -> None:
+    try:
+        await page.screenshot(path="error_seace.png", full_page=True)
+    except Exception:
+        pass
+
+
+def write_no_results() -> None:
+    with open("alertas_hoy.txt", "w", encoding="utf-8") as output:
+        output.write(NO_RESULTS_MESSAGE)
+
+
+def format_whatsapp_alert(licitacion: Convocatoria) -> str:
+    """Return one SEACE opportunity in the required direct-message format."""
+    return "\n".join(
+        (
+            "🔔 *NUEVA OPORTUNIDAD SEACE DETECTADA*",
+            "━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"🏢 *Entidad:* {licitacion.entidad or 'No disponible'}",
+            f"📋 *Proceso:* {licitacion.codigo_proceso or 'No disponible'}",
+            f"📦 *Objeto:* {licitacion.objeto_contrato or 'No disponible'}",
+            f"📅 *Fecha de publicación:* {licitacion.fecha_publicacion or 'No disponible'}",
+            "🔗 *Referencia:* Buscador Público SEACE 3.0",
+            "━━━━━━━━━━━━━━━━━━━━━━━━",
+            "⏱️ _Alerta enviada de forma automática._",
+        )
+    )
 
 
 def format_message(results: list[Convocatoria]) -> str:
@@ -238,20 +412,27 @@ def format_message(results: list[Convocatoria]) -> str:
     return "\n".join(lines).strip()
 
 
+def save_alerts(results: list[Convocatoria], path: str = "alertas_hoy.txt") -> None:
+    """Persist all generated alerts, separated for direct copy/paste."""
+    content = "\n\n".join(format_whatsapp_alert(item) for item in results)
+    with open(path, "w", encoding="utf-8") as output:
+        output.write(content)
+
+
 async def scrape(year: str, object_name: str, description: str, timeout_ms: int, headed: bool) -> list[Convocatoria]:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not headed)
-        page = await browser.new_page()
-        page.set_default_timeout(timeout_ms)
+        context = await browser.new_context()
+        page = await context.new_page()
+        page.set_default_timeout(180000)
+        page.set_default_navigation_timeout(180000)
         try:
+            print("[1/4] Accediendo al portal SEACE...")
             await page.goto(URL, wait_until="domcontentloaded", timeout=timeout_ms)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=timeout_ms)
-            except PlaywrightTimeoutError:
-                # The portal may keep polling; the form can still be usable.
-                pass
+            await page.wait_for_load_state("domcontentloaded")
             await page.locator("form").first.wait_for(state="visible", timeout=timeout_ms)
             await activate_procedures_search(page, timeout_ms)
+            print("[2/4] Aplicando filtros (Año, Tipo de contratación, Descripción)...")
             await set_field(page, "Año de convocatoria", year, ("anio", "ano", "year"))
             await set_object_field(page, object_name)
             await set_field(
@@ -261,9 +442,19 @@ async def scrape(year: str, object_name: str, description: str, timeout_ms: int,
                 ("descripcionObjeto", "descripcion", "description"),
             )
             await submit_search(page, timeout_ms)
-            return await extract_results(page)
+            return await paginate_results(page, headed)
+        except Exception:
+            await capture_error(page)
+            raise
         finally:
-            await browser.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -271,7 +462,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--year", default="2026")
     parser.add_argument("--object", dest="object_name", default="Bienes")
     parser.add_argument("--description", default="reactivos")
-    parser.add_argument("--timeout", type=int, default=90, help="Espera máxima por operación, en segundos")
+    parser.add_argument("--timeout", type=int, default=180, help="Espera máxima por operación, en segundos")
     parser.add_argument("--headed", action="store_true", help="Muestra el navegador para depuración")
     return parser.parse_args()
 
@@ -295,8 +486,14 @@ async def main() -> int:
         "convocatorias": [asdict(item) for item in results],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(f"\nTotal de convocatorias extraídas: {len(results)}")
+    if results:
+        save_alerts(results)
+    else:
+        write_no_results()
+        print(NO_RESULTS_MESSAGE)
     print("\n--- MENSAJE ---\n")
-    print(format_message(results))
+    print("\n\n".join(format_whatsapp_alert(item) for item in results) or NO_RESULTS_MESSAGE)
     return 0
 
 
