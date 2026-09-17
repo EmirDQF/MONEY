@@ -200,19 +200,8 @@ async def submit_search(page: Page, timeout_ms: int) -> None:
         raise LookupError("No se encontró el botón Buscar")
     await button.click()
     print("[3/4] Clic en Buscar ejecutado. Esperando respuesta AJAX de PrimeFaces...")
-    await wait_primefaces_ajax(page, timeout_ms)
-    await page.wait_for_timeout(4000)
+    await page.wait_for_timeout(3000)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    result_rows = page.locator(
-        "div[id*='tblResultados' i] tbody tr, "
-        ".ui-datatable-data tr, table tbody tr"
-    )
-    if not await result_rows.count():
-        try:
-            await page.screenshot(path="debug_search.png", full_page=True)
-        except Exception:
-            pass
-        await capture_error(page)
 
 
 def header_key(header: str) -> str | None:
@@ -235,70 +224,33 @@ def header_key(header: str) -> str | None:
 
 
 async def _extract_results(page: Page) -> list[Convocatoria]:
-    rows = page.locator(
-        "div[id*='tblResultados' i] tbody tr, "
-        ".ui-datatable-data tr, table tbody tr"
-    )
-    deadline = asyncio.get_running_loop().time() + 15
-    while asyncio.get_running_loop().time() < deadline:
-        if await rows.count() and await rows.first.is_visible():
-            print("[4/4] Tabla detectada. Extrayendo registros...")
-            break
-        await page.wait_for_timeout(500)
-    else:
-        await capture_error(page)
-        write_no_results()
-        return []
-
-    first_row = rows.first
-    first_row_class = await first_row.get_attribute("class") or ""
-    if "ui-datatable-empty-message" in first_row_class:
-        await capture_error(page)
-        write_no_results()
-        return []
-
+    rows = page.locator("tbody[id*='data'] tr, table tbody tr")
+    count = await rows.count()
+    print(f"[4/4] Filas detectadas en el DOM: {count}")
     results: list[Convocatoria] = []
-    for row_index in range(await rows.count()):
+    for row_index in range(count):
         row = rows.nth(row_index)
         cells = [clean(text) for text in await row.locator("td").all_text_contents()]
-        if len(cells) < 5:
+        if len(cells) < 5 or "ui-datatable-empty-message" in (await row.get_attribute("class") or ""):
             continue
-        row_text = normalized(" ".join(cells))
-        if any(term in row_text for term in ("cancelado", "desierto", "culminado", "no vigente")):
-            continue
-
-        table = row.locator("xpath=ancestor::table[1]")
-        headers = [clean(text) for text in await table.locator("thead th").all_text_contents()]
-        keys = [header_key(header) for header in headers]
-        values = {
-            key: cells[index] for index, key in enumerate(keys)
-            if key and index < len(cells)
-        }
-        # The current SEACE table uses: N°, entity, publication, nomenclature,
-        # reiniciado, object, description. Keep this fallback for dynamic headers.
-        values.setdefault("entidad", cells[1] if len(cells) > 1 else cells[0])
-        values.setdefault("fecha_publicacion", cells[2] if len(cells) > 2 else "")
-        values.setdefault("codigo_proceso", cells[3] if len(cells) > 3 else "")
-        values.setdefault("objeto_contrato", cells[6] if len(cells) > 6 else cells[-1])
-
         detail_link = row.locator("a[href]").first
-        ficha_tecnica = await detail_link.get_attribute("href") if await detail_link.count() else ""
         results.append(
             Convocatoria(
-                codigo_proceso=values.get("codigo_proceso", ""),
-                entidad=values.get("entidad", ""),
-                objeto_contrato=values.get("objeto_contrato", ""),
-                fecha_publicacion=values.get("fecha_publicacion", ""),
+                codigo_proceso=cells[3],
+                entidad=cells[1],
+                objeto_contrato=cells[5] if len(cells) > 5 else "",
+                fecha_publicacion=cells[2],
                 fecha_limite_registro="",
                 lugar="",
-                ficha_tecnica=ficha_tecnica or "",
+                ficha_tecnica=(
+                    await detail_link.get_attribute("href")
+                    if await detail_link.count()
+                    else ""
+                ) or "",
             )
         )
         if len(results) == MAX_EXTRACTION_RESULTS:
             break
-    if not results:
-        await capture_error(page)
-        write_no_results()
     return results
 
 
@@ -489,11 +441,15 @@ async def main() -> int:
     print(f"\nTotal de convocatorias extraídas: {len(results)}")
     if results:
         save_alerts(results)
+        generated_alerts = "\n\n".join(format_whatsapp_alert(item) for item in results)
+        print("¡Extracción completada con éxito!")
+        print(generated_alerts)
     else:
         write_no_results()
         print(NO_RESULTS_MESSAGE)
     print("\n--- MENSAJE ---\n")
-    print("\n\n".join(format_whatsapp_alert(item) for item in results) or NO_RESULTS_MESSAGE)
+    if not results:
+        print(NO_RESULTS_MESSAGE)
     return 0
 
 
