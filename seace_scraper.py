@@ -223,45 +223,48 @@ def header_key(header: str) -> str | None:
     return None
 
 
-async def _extract_results(page: Page) -> list[Convocatoria]:
-    rows = page.locator("tbody[id*='data'] tr, table tbody tr")
-    count = await rows.count()
-    print(f"[4/4] Filas detectadas en el DOM: {count}")
-    results: list[Convocatoria] = []
-    for row_index in range(count):
-        row = rows.nth(row_index)
-        cells = [clean(text) for text in await row.locator("td").all_text_contents()]
-        if len(cells) < 5 or "ui-datatable-empty-message" in (await row.get_attribute("class") or ""):
-            continue
-        detail_link = row.locator("a[href]").first
-        results.append(
-            Convocatoria(
-                codigo_proceso=cells[3],
-                entidad=cells[1],
-                objeto_contrato=cells[5] if len(cells) > 5 else "",
-                fecha_publicacion=cells[2],
-                fecha_limite_registro="",
-                lugar="",
-                ficha_tecnica=(
-                    await detail_link.get_attribute("href")
-                    if await detail_link.count()
-                    else ""
-                ) or "",
-            )
-        )
-        if len(results) == MAX_EXTRACTION_RESULTS:
-            break
-    return results
-
-
 async def extract_results(page: Page) -> list[Convocatoria]:
-    try:
-        return await _extract_results(page)
-    except Exception as error:
-        print(f"Error detectado: {error}")
-        print("Manteniendo el navegador abierto 30 segundos para inspección...")
-        await page.wait_for_timeout(30000)
-        raise
+    rows = page.locator("tbody[id*='data'] tr, table tbody tr")
+    total = await rows.count()
+    print(f"Procesando {total} filas encontradas...")
+
+    alertas: list[str] = []
+    results: list[Convocatoria] = []
+    for index in range(min(total, 5)):
+        row = rows.nth(index)
+        tds = row.locator("td")
+        if await tds.count() >= 5:
+            entidad = (await tds.nth(1).inner_text()).strip()
+            fecha = (await tds.nth(2).inner_text()).strip()
+            nomenclatura = (await tds.nth(3).inner_text()).strip()
+            objeto = (await tds.nth(5).inner_text()).strip() if await tds.count() > 5 else ""
+            alerta = (
+                "🔔 *NUEVA OPORTUNIDAD SEACE DETECTADA*\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏢 *Entidad:* {entidad}\n"
+                f"📋 *Proceso:* {nomenclatura}\n"
+                f"📦 *Objeto:* {objeto}\n"
+                f"📅 *Fecha:* {fecha}\n"
+                "🔗 *Referencia:* Convocatoria vigente SEACE 3.0\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            )
+            alertas.append(alerta)
+            results.append(
+                Convocatoria(
+                    codigo_proceso=nomenclatura,
+                    entidad=entidad,
+                    objeto_contrato=objeto,
+                    fecha_publicacion=fecha,
+                    fecha_limite_registro="",
+                )
+            )
+
+    with open("alertas_hoy.txt", "w", encoding="utf-8") as output:
+        output.write("\n\n".join(alertas))
+
+    print(" ¡Archivo alertas_hoy.txt guardado con éxito!")
+    print("\n" + "\n\n".join(alertas))
+    return results
 
 
 async def _pagination_marker(page: Page) -> tuple[str, str]:
@@ -332,7 +335,7 @@ def write_no_results() -> None:
 
 
 def format_whatsapp_alert(licitacion: Convocatoria) -> str:
-    """Return one SEACE opportunity in the required direct-message format."""
+    """Return one SEACE opportunity in the direct-message format."""
     return "\n".join(
         (
             "🔔 *NUEVA OPORTUNIDAD SEACE DETECTADA*",
@@ -340,10 +343,9 @@ def format_whatsapp_alert(licitacion: Convocatoria) -> str:
             f"🏢 *Entidad:* {licitacion.entidad or 'No disponible'}",
             f"📋 *Proceso:* {licitacion.codigo_proceso or 'No disponible'}",
             f"📦 *Objeto:* {licitacion.objeto_contrato or 'No disponible'}",
-            f"📅 *Fecha de publicación:* {licitacion.fecha_publicacion or 'No disponible'}",
-            "🔗 *Referencia:* Buscador Público SEACE 3.0",
+            f"📅 *Fecha:* {licitacion.fecha_publicacion or 'No disponible'}",
+            "🔗 *Referencia:* Convocatoria vigente SEACE 3.0",
             "━━━━━━━━━━━━━━━━━━━━━━━━",
-            "⏱️ _Alerta enviada de forma automática._",
         )
     )
 
@@ -394,7 +396,7 @@ async def scrape(year: str, object_name: str, description: str, timeout_ms: int,
                 ("descripcionObjeto", "descripcion", "description"),
             )
             await submit_search(page, timeout_ms)
-            return await paginate_results(page, headed)
+            return await extract_results(page)
         except Exception:
             await capture_error(page)
             raise
