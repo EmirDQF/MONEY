@@ -30,3 +30,4 @@ mediante AJAX. No espera navegaciones de página: espera el cierre del overlay,
 el cambio del número de página activo o de la primera fila y 1,5 segundos
 adicionales para estabilizar el DOM. Con `--headed`, mantiene la ventana abierta
 cinco segundos al finalizar la paginación para facilitar la inspección visual.
+"# scrapper-mony" 
